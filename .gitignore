@@ -9,3 +9,11 @@ build/
 .*.cmd
 Module.symvers
 modules.order
+*.bin
+*.elf
+*.hex
+*.dump
+*.log
+.env
+.env.*
+*.mdp

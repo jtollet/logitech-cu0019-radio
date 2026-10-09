@@ -13,6 +13,15 @@ production or that its RSSI interpretation has been established. Feedback
 on whether this belongs in the kernel rather than a userspace tool is
 particularly welcome.
 
+The wider question is whether proprietary wireless HID receivers could
+share diagnostic conventions for source, scope, units and freshness.
+This receiver-specific experiment does not implement that common API.
+Bluetooth is outside the proposed kernel scope: HCI and Linux Management
+already provide connection RSSI access, and BlueZ exposes discovery RSSI.
+Those existing interfaces can be reused by a future userspace frontend.
+See DESIGN.rst in the companion repository for the discussion outline:
+https://github.com/jtollet/logitech-cu0019-radio
+
 The module observes the HID bus through a non-exclusive subsys_interface.
 Reads default to disabled and require explicit opt-in. Active requests
 are restricted to bcdDevice 0302, feature report 5 and five fixed four-byte
@@ -49,7 +58,9 @@ Validation completed for this revision:
   KUnit suite has NOT been executed (the test system lacks CONFIG_KUNIT).
 * Exhaustive host tests of the exact protocol helpers on Linux and macOS.
 * Nine unit tests of the separate capture/summary tools on both systems.
-* Strict checkpatch source checks: no errors, warnings or checks.
+* Strict checkpatch source checks: no errors or warnings. A standalone
+  --no-tree rerun reports one CAMELCASE CHECK for the standard USB
+  descriptor member bcdDevice, which is unchanged.
 * The two patches apply to the stated base and reproduce the commit tree.
 
 Patch-mode checkpatch additionally emits its generic MAINTAINERS path
@@ -62,7 +73,9 @@ runtime test results, which are NOT claimed as validation of this series.
 Physical unplug/replug, system suspend/resume, lockdep/KASAN stress,
 allocation-failure tests, additional firmware units and controlled
 USB3-near/far measurements remain outstanding. The capture tools and test
-plan are kept outside the kernel patch series.
+plan are kept outside the kernel patch series. Later exploratory
+measurements used the older prototype, not the final RFC; they do not
+establish USB3 causation or resolve the RF interpretation gaps.
 
 AI assistance was used for the module, protocol helpers, tests,
 documentation and commit/cover-letter drafts. The task was to turn a

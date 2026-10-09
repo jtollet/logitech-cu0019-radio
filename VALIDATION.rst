@@ -19,7 +19,10 @@ Local kernel commits:
 ``git diff --check`` on the base-to-series diff: successful.
 
 Strict source-file checkpatch on the module, header and KUnit source:
-zero errors, zero warnings, zero checks. Strict patch-mode checkpatch:
+zero errors and zero warnings. Rechecking the standalone snapshots with
+``--no-tree --strict --file`` reports one CAMELCASE CHECK for the existing
+USB descriptor member ``bcdDevice``; that standard kernel field is unchanged.
+Strict patch-mode checkpatch:
 zero errors and zero checks, with one generic MAINTAINERS path-change
 advisory per patch. Existing ``Documentation/hid/``, ``drivers/hid/`` and
 ``drivers/hid/hid-logitech-*`` patterns already cover the added paths.
@@ -43,21 +46,54 @@ Completed compilation and offline tests
 * Nine Python capture/summary unit tests on macOS and Linux: successful.
   Hardware access is mocked; no hardware capture result is implied.
 
+Publication packaging added a tenth Python test that reconstructs the four
+new source/documentation files from patches 1 and 2 and compares them to
+the browsable snapshots. ``make check`` passes all ten Python tests and
+the exhaustive C host harness on macOS, without an external kernel tree.
+GitHub Actions is configured to run the same offline checks on Linux and
+macOS. This workflow does not build or load a kernel module or run KUnit.
+
 The external build reports compiler package revisions different from the
 kernel build (GCC 15.2-16 versus 15.2-12), pahole 1.30 versus 1.31, and skipped
 BTF generation because vmlinux is unavailable. These are recorded build
 environment limitations, not hidden driver warnings. A full build against
 the stated mainline base remains pending.
 
-Runtime state and gaps
-======================
+Runtime validation and gaps
+==========================
 
-The final RFC module was compiled but **not loaded**. The existing
-``logitech_cu0019_debug`` prototype was left loaded with its prior opt-in
-setting. No driver binding, persistent runtime-PM policy, service, timer or
-boot configuration was changed. The receiver was runtime-suspended at the
-last read-only state inspection; this is expected and does not establish
-mouse state.
+The final RFC module was compiled but **not loaded**. Runtime observations
+below concern the older ``logitech_cu0019_debug`` prototype, not the sources
+in this repository. The prototype was unloaded after the latest capture.
+Publication does not change host driver bindings, runtime-PM policy,
+services, timers or boot configuration. No current remote-host state is
+inferred from this historical record.
+
+Exploratory prototype observations
+=================================
+
+On 9 October 2026, direct / USB2-extension / direct exploratory samples
+had raw-value medians of 40 / 16 / 40. The first two phases contained
+30 successful samples each. The return-to-direct phase was interrupted
+after 23 successful samples by USB hub disconnections; connected storage
+also went offline. The cause was not established. The capture did not
+request a USB reset or a power-policy change. This incident is a reason
+to use a disposable test host for further lifetime and physical-USB tests.
+
+A later direct-connected capture after reboot collected 30 successful
+samples with raw-value median 40, minimum 16 and maximum 48. Its diagnostic
+counters showed 240 firmware read commands and zero read errors. The
+prototype was unloaded afterward.
+
+The user reported smoother mouse behavior with the extension. Geometry,
+movement, channel selection and possible nearby interference were not
+controlled enough to infer calibrated signal strength, noise power,
+packet loss or USB3 causation. These are exploratory prototype results,
+not a controlled RF comparison or runtime validation of the RFC module.
+Raw captures and host logs remain private and are excluded from publication.
+
+Outstanding tests
+=================
 
 Earlier prototype load/unload, cache and PM observations are not runtime
 validation of the rewritten RFC. Physical unplug/replug, system suspend,
