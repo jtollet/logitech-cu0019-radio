@@ -1,0 +1,104 @@
+From dca71b782577a9bde5f75359355bc81245426f0f Mon Sep 17 00:00:00 2001
+From: Jerome Tollet <jerome.tollet@gmail.com>
+Date: Fri, 9 Oct 2026 11:59:10 +0200
+Subject: [RFC PATCH 0/2] HID: opt-in radio diagnostics for Logitech C-U0019
+
+This series proposes an experimental debugfs companion for the Logitech
+C-U0019 receiver (046d:c542), without replacing hid-generic or usbhid.
+The aim is to investigate reception problems, including possible USB3
+interference, while preserving normal mouse input and driver bindings.
+
+This is an architecture RFC, not a claim that this interface is ready for
+production or that its RSSI interpretation has been established. Feedback
+on whether this belongs in the kernel rather than a userspace tool is
+particularly welcome.
+
+The module observes the HID bus through a non-exclusive subsys_interface.
+Reads default to disabled and require explicit opt-in. Active requests
+are restricted to bcdDevice 0302, feature report 5 and five fixed four-byte
+words. The response signature and observed DMA/RF layout are checked.
+There is no arbitrary register access, firmware/OTP extraction, register
+write, pairing command, background worker or automatic device binding.
+SET_REPORT submits the C0 read request, followed by GET_REPORT; it is not
+a firmware register-write operation. Undocumented access cannot be
+claimed to be risk-free.
+
+Four root-readable debugfs files separate identity, radio values, raw
+registers and diagnostics. Radio/register opens share a one-second cache
+and receive independent per-open snapshots. Suspended receivers are not
+resumed, and protocol/transport failures stop further reads. The decoded
+fields are deliberately named rssi_raw and frequency_mhz_candidate:
+calibration, measurement age and correspondence to mouse signal strength
+are unknown. PLL and RSSI are sequential reads, not an atomic channel
+measurement. There is no dBm, link quality, packet loss or mouse-presence
+claim.
+
+Important unresolved questions:
+
+* Is a non-exclusive HID bus observer appropriate for this diagnostic use?
+* What arbitration should protect a vendor SET/GET pair from other hidraw
+  feature clients? The private mutex does not provide that protection;
+  concurrent vendor-feature clients are explicitly unsupported here.
+* Are transport trylocks, active-only runtime PM references and the full
+  debugfs proxy sufficient for all unbind/hot-unplug/system-PM paths?
+
+Validation completed for this revision:
+
+* GCC W=1 external-module build against 7.2.6-070206-generic headers.
+* KUnit test source compiled as an object against those headers; the
+  KUnit suite has NOT been executed (the test system lacks CONFIG_KUNIT).
+* Exhaustive host tests of the exact protocol helpers on Linux and macOS.
+* Nine unit tests of the separate capture/summary tools on both systems.
+* Strict checkpatch source checks: no errors, warnings or checks.
+* The two patches apply to the stated base and reproduce the commit tree.
+
+Patch-mode checkpatch additionally emits its generic MAINTAINERS path
+change advisory; existing HID and Logitech patterns cover the new files.
+Signed-off-by is deliberately absent from this review draft: human review
+and DCO certification are required before submission. The final RFC has
+not been loaded on hardware. An earlier standalone prototype has limited
+runtime test results, which are NOT claimed as validation of this series.
+
+Physical unplug/replug, system suspend/resume, lockdep/KASAN stress,
+allocation-failure tests, additional firmware units and controlled
+USB3-near/far measurements remain outstanding. The capture tools and test
+plan are kept outside the kernel patch series.
+
+AI assistance was used for the module, protocol helpers, tests,
+documentation and commit/cover-letter drafts. The task was to turn a
+reverse-engineering prototype into a conservative optional companion,
+keep the existing HID driver unchanged, restrict undocumented requests,
+and make the remaining limitations and validation gaps explicit.
+The commits include Assisted-by: LLM; the human submitter must review and
+understand the complete contribution and add their own DCO sign-off.
+
+Protocol background:
+https://dev.to/endes/usb-hid-down-the-rabbit-hole-reverse-engineering-the-logitech-cu0019-usb-receiver-4d6a
+
+USB3/2.4 GHz interference background (Intel, April 2012):
+https://www.usb.org/sites/default/files/327216.pdf
+
+Jerome Tollet <jerome.tollet@gmail.com>
+
+Jerome Tollet (2):
+  HID: logitech: add an opt-in CU0019 radio debugfs companion
+  HID: logitech: add KUnit coverage for CU0019 read guards
+
+ Documentation/hid/hid-logitech-cu0019.rst | 107 +++++
+ Documentation/hid/index.rst               |   1 +
+ drivers/hid/Kconfig                       |  27 ++
+ drivers/hid/Makefile                      |   2 +
+ drivers/hid/hid-logitech-cu0019-debug.c   | 518 ++++++++++++++++++++++
+ drivers/hid/hid-logitech-cu0019-test.c    | 146 ++++++
+ drivers/hid/hid-logitech-cu0019.h         |  71 +++
+ 7 files changed, 872 insertions(+)
+ create mode 100644 Documentation/hid/hid-logitech-cu0019.rst
+ create mode 100644 drivers/hid/hid-logitech-cu0019-debug.c
+ create mode 100644 drivers/hid/hid-logitech-cu0019-test.c
+ create mode 100644 drivers/hid/hid-logitech-cu0019.h
+
+
+base-commit: af32da41b0327b9c6a37856ba82b6760d6c8d10e
+-- 
+2.56.0
+

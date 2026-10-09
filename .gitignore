@@ -1,0 +1,11 @@
+tests/protocol-test
+__pycache__/
+*.pyc
+captures/
+build/
+*.ko
+*.o
+*.mod*
+.*.cmd
+Module.symvers
+modules.order

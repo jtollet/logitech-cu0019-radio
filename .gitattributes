@@ -1,0 +1,3 @@
+# Preserve standard unified-diff context and git-format-patch email signatures.
+# Check the applied kernel diff separately, not the enclosing patch-as-text.
+patches/*.patch -whitespace

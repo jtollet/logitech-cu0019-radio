@@ -1,0 +1,810 @@
+From 049a88c36005066c741e1c25f6a3749608d8fbe6 Mon Sep 17 00:00:00 2001
+From: Jerome Tollet <jerome.tollet@gmail.com>
+Date: Fri, 9 Oct 2026 11:58:25 +0200
+Subject: [RFC PATCH 1/2] HID: logitech: add an opt-in CU0019 radio debugfs
+ companion
+
+The 046d:c542 C-U0019 receiver works with hid-generic but does not expose
+its vendor radio registers through standard HID reports. Add an optional
+debugfs companion for studying reception problems without replacing the
+normal HID and USB drivers or adding a stable userspace ABI.
+
+Observe the HID bus with a non-exclusive subsys_interface. Restrict
+active access to USB bcdDevice 0302, feature report 5 and five fixed
+four-byte register words. Validate the reply signature and observed
+DMA/RF layout before publishing raw RSSI and a PLL frequency candidate.
+Do not infer dBm, mouse presence, packet loss or RF measurement age.
+
+Keep reads disabled by default, on demand, root-only and rate limited.
+Share one cache between radio and raw-register views, invalidate failed
+samples, and stop probing after a transport/protocol failure. Do not
+resume a suspended receiver. Use device references, transport trylocks
+and independent per-open snapshots to separate debugfs and device
+lifetimes. No background worker or device-driver binding is added.
+
+This RFC requests feedback on the companion architecture and exclusive
+feature-channel arbitration. Its mutex does not serialize vendor-feature
+requests from unrelated hidraw clients; concurrent use is unsupported.
+Physical unplug and system suspend stress testing remain outstanding.
+
+Assisted-by: LLM
+---
+ Documentation/hid/hid-logitech-cu0019.rst | 107 +++++
+ Documentation/hid/index.rst               |   1 +
+ drivers/hid/Kconfig                       |  16 +
+ drivers/hid/Makefile                      |   1 +
+ drivers/hid/hid-logitech-cu0019-debug.c   | 518 ++++++++++++++++++++++
+ drivers/hid/hid-logitech-cu0019.h         |  71 +++
+ 6 files changed, 714 insertions(+)
+ create mode 100644 Documentation/hid/hid-logitech-cu0019.rst
+ create mode 100644 drivers/hid/hid-logitech-cu0019-debug.c
+ create mode 100644 drivers/hid/hid-logitech-cu0019.h
+
+diff --git a/Documentation/hid/hid-logitech-cu0019.rst b/Documentation/hid/hid-logitech-cu0019.rst
+new file mode 100644
+index 0000000..da6d8fb
+--- /dev/null
++++ b/Documentation/hid/hid-logitech-cu0019.rst
+@@ -0,0 +1,107 @@
++.. SPDX-License-Identifier: GPL-2.0-only
++
++=======================================
++Logitech C-U0019 radio debugfs companion
++=======================================
++
++This experimental companion observes USB receiver 046d:c542 through a
++non-exclusive HID bus interface. It neither registers a HID/USB driver nor
++changes the driver binding, input reports, pairing or power policy. Normal
++mouse operation remains with hid-generic and usbhid.
++
++Usage
++=====
++
++Enable CONFIG_HID_LOGITECH_CU0019_DEBUG and CONFIG_DEBUG_FS, mount debugfs,
++and explicitly load the companion::
++
++    modprobe hid-logitech-cu0019-debug
++    cat /sys/kernel/debug/cu0019/*/identity
++
++Loading alone performs no vendor transfers. To opt into active reads,
++unload the companion and reload with enable_reads=1. The parameter is
++read-only and defaults to false. There is no device modalias, automatic
++loading requirement, background polling, timer or worker.
++
++Only USB bcdDevice 0302 and feature report 5 with 56 data bits are accepted
++for active reads. Suspended devices are not resumed. A normal HID client
++can wake the receiver; this companion does not change autosuspend settings.
++
++Do not use another vendor-feature client while these reads are enabled.
++The companion's mutex serializes its own operations, not hidraw ioctls
++from other clients. No exclusive ownership of the feature channel is
++provided by this RFC design. Undocumented access is not provably risk-free.
++
++Debugfs files
++=============
++
++The directory name is the existing HID device name. All four files are
++root-readable (0400), with no write operation. This is debugfs, not a stable
++userspace ABI.
++
++``identity``
++  HID name, USB ID, bcdDevice, read opt-in and supported-firmware flag.
++  Reading this file never polls the receiver.
++
++``radio``
++  Status and, only for a successful sample, raw RSSI and PLL-derived
++  frequency_mhz_candidate. No calibration or diagnostic counters are mixed
++  into the radio measurements.
++
++``registers``
++  Status and, only for a successful sample, the fixed raw register words.
++  Decoded radio values are not repeated here.
++
++``diagnostics``
++  Last attempt status/error, quarantine, attempts, firmware read commands,
++  read errors, skipped reads, cache hits and attempt timing. Suspended/busy
++  devices count as skipped reads, not protocol failures. Reading this file
++  never polls the receiver.
++
++``radio`` and ``registers`` share a cache. Opening either may trigger one
++new collection, with at least one second between attempts, measured from
++completion. Each open receives an independent copy: read and seek do not
++initiate transfers. Failure invalidates the previous sample, so stale radio
++values are not presented as valid. A transport/protocol failure quarantines
++further probing until the companion is reloaded or the device is recreated.
++
++Protocol and interpretation
++===========================
++
++Each firmware read is an eight-byte feature SET_REPORT followed by a
++GET_REPORT. The request is ``05 c0 LL HH 00 00 00 00``; LL/HH are the fixed
++little-endian register address. SET_REPORT submits a read opcode, not a
++register write. The reply is four raw data bytes followed by the observed
++signature ``03 02 21 84``. Short, long and unexpected replies are rejected.
++
++Only these four-byte words can be requested:
++
++* 0x0508: observed DMA layout guard;
++* 0x0438: observed RF configuration guard;
++* 0x0740: system tick before and after the radio reads;
++* 0x04d4: PLL word, whose upper half is a frequency candidate;
++* 0x0458: raw RSSI word.
++
++A successful collection uses eight firmware read commands: initial DMA/RF
++guards, tick/PLL/RSSI/tick, then final DMA/RF guards. It does not access RX
++packet payload, arbitrary addresses, firmware, OTP or pairing data. There is
++no register-write, LED, reset or radio-reconfiguration command.
++
++RSSI calibration and measurement age are unknown. In particular, raw RSSI
++must not be labelled as dBm, mouse signal strength, noise floor or link
++quality without additional validation. A stopped mouse does not establish
++absence of RF activity. The system tick is not a packet counter or last-seen
++timestamp. The PLL candidate and RSSI are sequential reads, not an atomic
++same-channel measurement, and hopping can occur between them.
++
++Review scope
++============
++
++The companion uses the full debugfs proxy and device references for removal
++lifetime. It takes transport trylocks rather than waiting for unbind, and
++holds an active-only runtime PM reference for a collection. The receiver
++mutex is released before removing debugfs entries and draining active opens.
++
++This RFC does not establish production safety. Physical hot-unplug, system
++suspend/resume, allocation-failure and lockdep/KASAN stress tests, as well as
++feature-channel arbitration with hidraw, require review and validation.
+diff --git a/Documentation/hid/index.rst b/Documentation/hid/index.rst
+index baf156b..cd9989c 100644
+--- a/Documentation/hid/index.rst
++++ b/Documentation/hid/index.rst
+@@ -17,6 +17,7 @@ Human Interface Devices (HID)
+    uhid
+ 
+    hid-alps
++   hid-logitech-cu0019
+    intel-ish-hid
+    intel-thc-hid
+    amd-sfh-hid
+diff --git a/drivers/hid/Kconfig b/drivers/hid/Kconfig
+index c43e824..bf457f2 100644
+--- a/drivers/hid/Kconfig
++++ b/drivers/hid/Kconfig
+@@ -683,6 +683,22 @@ config HID_LOGITECH
+ 	help
+ 	Support for Logitech devices that are not fully compliant with HID standard.
+ 
++config HID_LOGITECH_CU0019_DEBUG
++	tristate "Logitech C-U0019 radio diagnostics (EXPERIMENTAL)"
++	depends on USB_HID && HID_GENERIC && DEBUG_FS
++	help
++	  Add a read-only debugfs companion for USB receiver 046d:c542.
++	  It observes the HID bus without replacing hid-generic or usbhid.
++	  Register reads require an explicit enable_reads=1 module parameter
++	  and are restricted to the tested bcdDevice 0302 firmware.
++
++	  The vendor protocol is undocumented. This diagnostic interface is
++	  experimental and must not be used alongside another vendor-feature
++	  client. It does not provide calibrated dBm or mouse presence data.
++
++	  To compile this companion as a module, choose M here: the module
++	  will be called hid-logitech-cu0019-debug. If unsure, say N.
++
+ config HID_LOGITECH_DJ
+ 	tristate "Logitech receivers full support"
+ 	depends on USB_HID
+diff --git a/drivers/hid/Makefile b/drivers/hid/Makefile
+index 48a863b..9bfa93b 100644
+--- a/drivers/hid/Makefile
++++ b/drivers/hid/Makefile
+@@ -82,6 +82,7 @@ obj-$(CONFIG_HID_LENOVO_GO_S)	+= hid-lenovo-go-s.o
+ obj-$(CONFIG_HID_LETSKETCH)	+= hid-letsketch.o
+ obj-$(CONFIG_HID_LOGITECH)	+= hid-logitech.o
+ obj-$(CONFIG_HID_LOGITECH)	+= hid-lg-g15.o
++obj-$(CONFIG_HID_LOGITECH_CU0019_DEBUG) += hid-logitech-cu0019-debug.o
+ obj-$(CONFIG_HID_LOGITECH_DJ)	+= hid-logitech-dj.o
+ obj-$(CONFIG_HID_LOGITECH_HIDPP)	+= hid-logitech-hidpp.o
+ obj-$(CONFIG_HID_MACALLY)	+= hid-macally.o
+diff --git a/drivers/hid/hid-logitech-cu0019-debug.c b/drivers/hid/hid-logitech-cu0019-debug.c
+new file mode 100644
+index 0000000..6e9c64f
+--- /dev/null
++++ b/drivers/hid/hid-logitech-cu0019-debug.c
+@@ -0,0 +1,518 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Non-exclusive debugfs companion for the Logitech C-U0019 receiver.
++ * Mouse input remains owned by hid-generic and usbhid.
++ */
++
++#include <linux/array_size.h>
++#include <linux/debugfs.h>
++#include <linux/device.h>
++#include <linux/hid.h>
++#include <linux/ktime.h>
++#include <linux/list.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/pm_runtime.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++#include <linux/usb.h>
++
++#include "hid-logitech-cu0019.h"
++
++static bool enable_reads;
++module_param(enable_reads, bool, 0400);
++MODULE_PARM_DESC(enable_reads,
++		 "Enable fixed register reads on demand (default: false)");
++
++enum cu0019_file_kind {
++	CU0019_IDENTITY,
++	CU0019_RADIO,
++	CU0019_REGISTERS,
++	CU0019_DIAGNOSTICS,
++	CU0019_FILE_COUNT,
++};
++
++struct cu0019_sample {
++	u8 dma[4];
++	u8 rf_config[4];
++	u8 tick_before[4];
++	u8 tick_after[4];
++	u8 pll[4];
++	u8 rssi[4];
++};
++
++struct cu0019_snapshot {
++	enum cu0019_file_kind kind;
++	char device[64];
++	u16 bcd_device;
++	bool valid;
++	bool quarantined;
++	int error;
++	const char *status;
++	u64 attempted_ns;
++	u64 duration_ns;
++	u64 opened_ns;
++	u64 refresh_attempts;
++	u64 read_commands;
++	u64 read_errors;
++	u64 skipped_reads;
++	u64 cache_hits;
++	struct cu0019_sample sample;
++};
++
++struct cu0019_receiver;
++
++struct cu0019_file {
++	struct cu0019_receiver *receiver;
++	enum cu0019_file_kind kind;
++};
++
++struct cu0019_receiver {
++	struct list_head node;
++	struct hid_device *hdev;
++	struct usb_interface *intf;
++	struct usb_device *udev;
++	struct mutex lock; /* Protects the cache and vendor transactions. */
++	struct dentry *directory;
++	struct cu0019_file files[CU0019_FILE_COUNT];
++	struct cu0019_snapshot cache;
++	u64 next_attempt_ns;
++	bool stopping;
++	/* HID control transfers require a heap-backed buffer. */
++	u8 transfer[CU0019_REPORT_SIZE];
++};
++
++static struct dentry *cu0019_debugfs_root;
++static LIST_HEAD(cu0019_receivers);
++static DEFINE_MUTEX(cu0019_receivers_lock);
++
++/* Caller holds receiver->lock, transport device locks and an active PM ref. */
++static int cu0019_read_register(struct cu0019_receiver *receiver, u16 address,
++				u8 *data)
++{
++	int ret;
++
++	ret = cu0019_build_read_request(address, receiver->transfer);
++	if (ret)
++		return ret;
++
++	receiver->cache.read_commands++;
++	ret = hid_hw_raw_request(receiver->hdev, CU0019_REPORT_ID,
++				 receiver->transfer, CU0019_REPORT_SIZE,
++				 HID_FEATURE_REPORT, HID_REQ_SET_REPORT);
++	if (ret < 0)
++		return ret;
++	if (ret != CU0019_REPORT_SIZE)
++		return -EPROTO;
++
++	memset(receiver->transfer, 0, sizeof(receiver->transfer));
++	receiver->transfer[0] = CU0019_REPORT_ID;
++	ret = hid_hw_raw_request(receiver->hdev, CU0019_REPORT_ID,
++				 receiver->transfer, CU0019_REPORT_SIZE,
++				 HID_FEATURE_REPORT, HID_REQ_GET_REPORT);
++	if (ret < 0)
++		return ret;
++	if (!cu0019_response_valid(receiver->transfer, ret))
++		return -EPROTO;
++
++	memcpy(data, receiver->transfer, 4);
++	return 0;
++}
++
++static int cu0019_collect(struct cu0019_receiver *receiver,
++			  struct cu0019_sample *sample)
++{
++	u8 check[4];
++	int ret;
++
++	ret = cu0019_read_register(receiver, CU0019_REG_DMA, sample->dma);
++	if (ret)
++		return ret;
++	if (!cu0019_dma_valid(sample->dma))
++		return -EPROTO;
++	ret = cu0019_read_register(receiver, CU0019_REG_RF_CONFIG,
++				   sample->rf_config);
++	if (ret)
++		return ret;
++	if (!cu0019_rf_config_valid(sample->rf_config))
++		return -EPROTO;
++	ret = cu0019_read_register(receiver, CU0019_REG_TICK,
++				   sample->tick_before);
++	if (ret)
++		return ret;
++	ret = cu0019_read_register(receiver, CU0019_REG_PLL, sample->pll);
++	if (ret)
++		return ret;
++	if (!cu0019_pll_valid(sample->pll))
++		return -EPROTO;
++	ret = cu0019_read_register(receiver, CU0019_REG_RSSI, sample->rssi);
++	if (ret)
++		return ret;
++	ret = cu0019_read_register(receiver, CU0019_REG_TICK,
++				   sample->tick_after);
++	if (ret)
++		return ret;
++	ret = cu0019_read_register(receiver, CU0019_REG_DMA, check);
++	if (ret)
++		return ret;
++	if (!cu0019_dma_valid(check))
++		return -EPROTO;
++	ret = cu0019_read_register(receiver, CU0019_REG_RF_CONFIG, check);
++	if (ret)
++		return ret;
++	return cu0019_rf_config_valid(check) ? 0 : -EPROTO;
++}
++
++/* Trylocks avoid waiting for unbind, which can wait for a debugfs open. */
++static bool cu0019_lock_transport(struct cu0019_receiver *receiver)
++{
++	if (!device_trylock(&receiver->udev->dev))
++		return false;
++	if (!device_trylock(&receiver->intf->dev))
++		goto unlock_usb;
++	if (!device_trylock(&receiver->hdev->dev))
++		goto unlock_interface;
++	return true;
++
++unlock_interface:
++	device_unlock(&receiver->intf->dev);
++unlock_usb:
++	device_unlock(&receiver->udev->dev);
++	return false;
++}
++
++static void cu0019_unlock_transport(struct cu0019_receiver *receiver)
++{
++	device_unlock(&receiver->hdev->dev);
++	device_unlock(&receiver->intf->dev);
++	device_unlock(&receiver->udev->dev);
++}
++
++static int cu0019_validate_transport(struct cu0019_receiver *receiver)
++{
++	struct cu0019_snapshot *snapshot = &receiver->cache;
++	struct hid_device *hdev = receiver->hdev;
++	struct hid_report *feature;
++
++	if (READ_ONCE(receiver->udev->state) == USB_STATE_SUSPENDED) {
++		snapshot->status = "usb_not_active";
++		return -EAGAIN;
++	}
++	if (READ_ONCE(receiver->udev->state) != USB_STATE_CONFIGURED ||
++	    !receiver->intf->dev.driver ||
++	    strcmp(receiver->intf->dev.driver->name, "usbhid") ||
++	    !hdev->dev.driver ||
++	    strcmp(hdev->dev.driver->name, "hid-generic")) {
++		snapshot->status = "transport_unavailable";
++		return -ENODEV;
++	}
++	feature = hdev->report_enum[HID_FEATURE_REPORT]
++			  .report_id_hash[CU0019_REPORT_ID];
++	if (!feature || feature->size != 56 || !hdev->ll_driver ||
++	    !hdev->ll_driver->raw_request) {
++		snapshot->status = "unexpected_feature_report";
++		snapshot->quarantined = true;
++		return -EPROTO;
++	}
++	return 0;
++}
++
++static void cu0019_refresh(struct cu0019_receiver *receiver)
++{
++	struct cu0019_snapshot *snapshot = &receiver->cache;
++	u64 started_ns = ktime_get_ns();
++	bool pm_reference = false;
++	int ret;
++
++	if (!enable_reads || receiver->stopping || snapshot->quarantined)
++		return;
++	if (started_ns < receiver->next_attempt_ns) {
++		snapshot->cache_hits++;
++		return;
++	}
++
++	snapshot->valid = false;
++	snapshot->refresh_attempts++;
++	snapshot->attempted_ns = started_ns;
++	memset(&snapshot->sample, 0, sizeof(snapshot->sample));
++	if (snapshot->bcd_device != CU0019_BCD_DEVICE) {
++		snapshot->status = "unsupported_firmware";
++		ret = -EOPNOTSUPP;
++		goto complete;
++	}
++	if (!cu0019_lock_transport(receiver)) {
++		snapshot->status = "device_busy";
++		ret = -EBUSY;
++		goto complete;
++	}
++
++	ret = cu0019_validate_transport(receiver);
++	if (ret)
++		goto unlock;
++	if (pm_runtime_enabled(&receiver->udev->dev)) {
++		ret = pm_runtime_get_if_active(&receiver->udev->dev);
++		if (ret <= 0) {
++			snapshot->status = "usb_not_active";
++			ret = -EAGAIN;
++			goto unlock;
++		}
++		pm_reference = true;
++	}
++
++	ret = cu0019_collect(receiver, &snapshot->sample);
++	if (ret) {
++		snapshot->status = "read_failed";
++		snapshot->quarantined = true;
++	} else {
++		snapshot->status = "ok";
++		snapshot->valid = true;
++	}
++	if (pm_reference)
++		pm_runtime_put_noidle(&receiver->udev->dev);
++unlock:
++	cu0019_unlock_transport(receiver);
++complete:
++	snapshot->error = ret;
++	if (ret) {
++		if (snapshot->quarantined)
++			snapshot->read_errors++;
++		else
++			snapshot->skipped_reads++;
++	}
++	snapshot->duration_ns = ktime_get_ns() - started_ns;
++	receiver->next_attempt_ns = ktime_get_ns() + NSEC_PER_SEC;
++}
++
++static int cu0019_show(struct seq_file *file, void *unused)
++{
++	const struct cu0019_snapshot *snapshot = file->private;
++	const struct cu0019_sample *sample = &snapshot->sample;
++
++	if (snapshot->kind == CU0019_IDENTITY) {
++		seq_printf(file, "device=%s\n", snapshot->device);
++		seq_puts(file, "usb_id=046d:c542\n");
++		seq_printf(file, "bcd_device=0x%04x\n", snapshot->bcd_device);
++		seq_printf(file, "reads_enabled=%u\n", enable_reads);
++		seq_printf(file, "supported_firmware=%u\n",
++			   snapshot->bcd_device == CU0019_BCD_DEVICE);
++		return 0;
++	}
++	if (snapshot->kind == CU0019_DIAGNOSTICS) {
++		seq_printf(file, "last_status=%s\nlast_error=%d\n",
++			   snapshot->status, snapshot->error);
++		seq_printf(file, "quarantined=%u\n", snapshot->quarantined);
++		seq_printf(file, "refresh_attempts=%llu\nread_commands=%llu\n",
++			   snapshot->refresh_attempts, snapshot->read_commands);
++		seq_printf(file, "read_errors=%llu\nskipped_reads=%llu\n",
++			   snapshot->read_errors, snapshot->skipped_reads);
++		seq_printf(file, "cache_hits=%llu\n", snapshot->cache_hits);
++		seq_printf(file, "last_attempt_monotonic_ns=%llu\n",
++			   snapshot->attempted_ns);
++		seq_printf(file, "last_attempt_age_at_open_ms=%llu\n",
++			   snapshot->attempted_ns ? (snapshot->opened_ns -
++						     snapshot->attempted_ns) /
++							    NSEC_PER_MSEC :
++						    0);
++		seq_printf(file, "last_attempt_duration_us=%llu\n",
++			   snapshot->duration_ns / NSEC_PER_USEC);
++		seq_puts(file, "minimum_poll_interval_ms=1000\n");
++		return 0;
++	}
++
++	seq_printf(file, "status=%s\n", snapshot->status);
++	if (!snapshot->valid)
++		return 0;
++	if (snapshot->kind == CU0019_RADIO) {
++		seq_printf(file, "rssi_raw=%u\n", sample->rssi[0]);
++		seq_printf(file, "frequency_mhz_candidate=%u\n",
++			   get_unaligned_le16(sample->pll + 2));
++		return 0;
++	}
++	seq_printf(file, "0x0508=%*ph\n0x0438=%*ph\n", 4, sample->dma, 4,
++		   sample->rf_config);
++	seq_printf(file, "0x0740_before=%*ph\n0x0740_after=%*ph\n", 4,
++		   sample->tick_before, 4, sample->tick_after);
++	seq_printf(file, "0x04d4=%*ph\n0x0458=%*ph\n", 4, sample->pll, 4,
++		   sample->rssi);
++	return 0;
++}
++
++static int cu0019_open(struct inode *inode, struct file *file)
++{
++	const struct cu0019_file *entry = inode->i_private;
++	struct cu0019_receiver *receiver = entry->receiver;
++	struct cu0019_snapshot *snapshot;
++	int ret;
++
++	snapshot = kzalloc_obj(*snapshot);
++	if (!snapshot)
++		return -ENOMEM;
++
++	mutex_lock(&receiver->lock);
++	if (receiver->stopping) {
++		ret = -ENODEV;
++		goto unlock_free;
++	}
++	if (entry->kind == CU0019_RADIO || entry->kind == CU0019_REGISTERS)
++		cu0019_refresh(receiver);
++	*snapshot = receiver->cache;
++	snapshot->kind = entry->kind;
++	snapshot->opened_ns = ktime_get_ns();
++	mutex_unlock(&receiver->lock);
++
++	/* Reads, seeks and release only access this independent per-open copy. */
++	ret = single_open(file, cu0019_show, snapshot);
++	if (!ret)
++		return 0;
++	goto free_snapshot;
++
++unlock_free:
++	mutex_unlock(&receiver->lock);
++free_snapshot:
++	kfree(snapshot);
++	return ret;
++}
++
++static int cu0019_release(struct inode *inode, struct file *file)
++{
++	struct seq_file *seq = file->private_data;
++	struct cu0019_snapshot *snapshot = seq->private;
++	int ret;
++
++	ret = single_release(inode, file);
++	kfree(snapshot);
++	return ret;
++}
++
++static const struct file_operations cu0019_file_operations = {
++	.owner = THIS_MODULE,
++	.open = cu0019_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = cu0019_release,
++};
++
++static void cu0019_destroy(struct cu0019_receiver *receiver)
++{
++	mutex_lock(&receiver->lock);
++	receiver->stopping = true;
++	mutex_unlock(&receiver->lock);
++
++	/* The full debugfs proxy drains opens; never hold their mutex here. */
++	debugfs_remove(receiver->directory);
++	put_device(&receiver->hdev->dev);
++	usb_put_intf(receiver->intf);
++	usb_put_dev(receiver->udev);
++	kfree(receiver);
++}
++
++static int cu0019_add(struct device *device, struct subsys_interface *interface)
++{
++	static const char *const names[] = {
++		"identity",
++		"radio",
++		"registers",
++		"diagnostics",
++	};
++	struct hid_device *hdev = to_hid_device(device);
++	struct cu0019_receiver *receiver;
++	struct dentry *entry;
++	unsigned int i;
++	int ret = 0;
++
++	if (hdev->bus != BUS_USB || hdev->vendor != CU0019_VENDOR_ID ||
++	    hdev->product != CU0019_PRODUCT_ID || !hid_is_usb(hdev))
++		return 0;
++
++	receiver = kzalloc_obj(*receiver);
++	if (!receiver)
++		return -ENOMEM;
++	receiver->hdev = to_hid_device(get_device(device));
++	receiver->intf = usb_get_intf(to_usb_interface(device->parent));
++	receiver->udev = usb_get_dev(interface_to_usbdev(receiver->intf));
++	mutex_init(&receiver->lock);
++	strscpy(receiver->cache.device, dev_name(device),
++		sizeof(receiver->cache.device));
++	receiver->cache.bcd_device =
++		le16_to_cpu(receiver->udev->descriptor.bcdDevice);
++	receiver->cache.status = enable_reads ? "not_sampled" :
++						"reads_disabled";
++	receiver->directory =
++		debugfs_create_dir(dev_name(device), cu0019_debugfs_root);
++	if (IS_ERR(receiver->directory)) {
++		ret = PTR_ERR(receiver->directory);
++		receiver->directory = NULL;
++		goto destroy_receiver;
++	}
++	for (i = 0; i < ARRAY_SIZE(names); i++) {
++		receiver->files[i].receiver = receiver;
++		receiver->files[i].kind = i;
++		entry = debugfs_create_file(names[i], 0400, receiver->directory,
++					    &receiver->files[i],
++					    &cu0019_file_operations);
++		if (IS_ERR(entry)) {
++			ret = PTR_ERR(entry);
++			goto destroy_receiver;
++		}
++	}
++	mutex_lock(&cu0019_receivers_lock);
++	list_add_tail(&receiver->node, &cu0019_receivers);
++	mutex_unlock(&cu0019_receivers_lock);
++	return 0;
++
++destroy_receiver:
++	cu0019_destroy(receiver);
++	dev_dbg(device, "Cannot create CU0019 debugfs files: %d\n", ret);
++	return ret;
++}
++
++static void cu0019_remove(struct device *device,
++			  struct subsys_interface *interface)
++{
++	struct cu0019_receiver *receiver;
++	struct cu0019_receiver *next;
++
++	mutex_lock(&cu0019_receivers_lock);
++	list_for_each_entry_safe(receiver, next, &cu0019_receivers, node) {
++		if (&receiver->hdev->dev != device)
++			continue;
++		list_del(&receiver->node);
++		mutex_unlock(&cu0019_receivers_lock);
++		cu0019_destroy(receiver);
++		return;
++	}
++	mutex_unlock(&cu0019_receivers_lock);
++}
++
++static struct subsys_interface cu0019_interface = {
++	.name = "hid-logitech-cu0019-debug",
++	.subsys = &hid_bus_type,
++	.add_dev = cu0019_add,
++	.remove_dev = cu0019_remove,
++};
++
++static int __init cu0019_init(void)
++{
++	int ret;
++
++	cu0019_debugfs_root = debugfs_create_dir("cu0019", NULL);
++	if (IS_ERR(cu0019_debugfs_root))
++		return PTR_ERR(cu0019_debugfs_root);
++	ret = subsys_interface_register(&cu0019_interface);
++	if (ret)
++		debugfs_remove(cu0019_debugfs_root);
++	return ret;
++}
++
++static void __exit cu0019_exit(void)
++{
++	subsys_interface_unregister(&cu0019_interface);
++	debugfs_remove(cu0019_debugfs_root);
++}
++
++module_init(cu0019_init);
++module_exit(cu0019_exit);
++
++MODULE_AUTHOR("Jerome Tollet <jerome.tollet@gmail.com>");
++MODULE_DESCRIPTION("Read-only radio debugfs companion for Logitech C-U0019");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/hid/hid-logitech-cu0019.h b/drivers/hid/hid-logitech-cu0019.h
+new file mode 100644
+index 0000000..34b4bab
+--- /dev/null
++++ b/drivers/hid/hid-logitech-cu0019.h
+@@ -0,0 +1,71 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef HID_LOGITECH_CU0019_H
++#define HID_LOGITECH_CU0019_H
++
++#include <linux/errno.h>
++#include <linux/string.h>
++#include <linux/types.h>
++#include <linux/unaligned.h>
++
++#define CU0019_VENDOR_ID 0x046d
++#define CU0019_PRODUCT_ID 0xc542
++#define CU0019_BCD_DEVICE 0x0302
++#define CU0019_REPORT_ID 5
++#define CU0019_REPORT_SIZE 8
++#define CU0019_READ_OPCODE 0xc0
++
++#define CU0019_REG_DMA 0x0508
++#define CU0019_REG_RF_CONFIG 0x0438
++#define CU0019_REG_TICK 0x0740
++#define CU0019_REG_PLL 0x04d4
++#define CU0019_REG_RSSI 0x0458
++
++static inline bool cu0019_address_allowed(u16 address)
++{
++	return address == CU0019_REG_DMA || address == CU0019_REG_RF_CONFIG ||
++	       address == CU0019_REG_TICK || address == CU0019_REG_PLL ||
++	       address == CU0019_REG_RSSI;
++}
++
++/* SET_REPORT submits a firmware read request, not a register write. */
++static inline int cu0019_build_read_request(u16 address, u8 *buffer)
++{
++	if (!cu0019_address_allowed(address))
++		return -EINVAL;
++
++	memset(buffer, 0, CU0019_REPORT_SIZE);
++	buffer[0] = CU0019_REPORT_ID;
++	buffer[1] = CU0019_READ_OPCODE;
++	put_unaligned_le16(address, buffer + 2);
++	return 0;
++}
++
++/* Replies contain four data bytes followed by this firmware signature. */
++static inline bool cu0019_response_valid(const u8 *buffer, int length)
++{
++	return length == CU0019_REPORT_SIZE && buffer[4] == 0x03 &&
++	       buffer[5] == 0x02 && buffer[6] == 0x21 && buffer[7] == 0x84;
++}
++
++static inline bool cu0019_dma_valid(const u8 *buffer)
++{
++	u16 address = get_unaligned_le16(buffer);
++
++	return (address == 0x9468 || address == 0x94c8) &&
++	       get_unaligned_le16(buffer + 2) == 0x0106;
++}
++
++static inline bool cu0019_rf_config_valid(const u8 *buffer)
++{
++	return buffer[0] == 0x37 && buffer[1] == 0x72 && buffer[2] == 0x77 &&
++	       buffer[3] == 0xec;
++}
++
++static inline bool cu0019_pll_valid(const u8 *buffer)
++{
++	u16 frequency = get_unaligned_le16(buffer + 2);
++
++	return frequency >= 2400 && frequency <= 2484;
++}
++
++#endif /* HID_LOGITECH_CU0019_H */
+-- 
+2.56.0
+

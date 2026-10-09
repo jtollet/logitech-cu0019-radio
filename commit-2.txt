@@ -1,0 +1,12 @@
+HID: logitech: add KUnit coverage for CU0019 read guards
+
+Exercise the CU0019 protocol helpers without issuing any USB requests.
+Check all 16-bit addresses against the fixed allowlist, the exact read
+request bytes, and preservation of the request buffer on rejection.
+
+Reject truncated/oversized replies and all single-byte mutations of the
+response signature and RF configuration. Exhaustively check DMA pointer,
+DMA control word and PLL frequency range guards. This suite does not
+claim to test USB transport, power management or hot-unplug lifetime.
+
+Assisted-by: LLM

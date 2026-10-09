@@ -1,0 +1,26 @@
+HID: logitech: add an opt-in CU0019 radio debugfs companion
+
+The 046d:c542 C-U0019 receiver works with hid-generic but does not expose
+its vendor radio registers through standard HID reports. Add an optional
+debugfs companion for studying reception problems without replacing the
+normal HID and USB drivers or adding a stable userspace ABI.
+
+Observe the HID bus with a non-exclusive subsys_interface. Restrict
+active access to USB bcdDevice 0302, feature report 5 and five fixed
+four-byte register words. Validate the reply signature and observed
+DMA/RF layout before publishing raw RSSI and a PLL frequency candidate.
+Do not infer dBm, mouse presence, packet loss or RF measurement age.
+
+Keep reads disabled by default, on demand, root-only and rate limited.
+Share one cache between radio and raw-register views, invalidate failed
+samples, and stop probing after a transport/protocol failure. Do not
+resume a suspended receiver. Use device references, transport trylocks
+and independent per-open snapshots to separate debugfs and device
+lifetimes. No background worker or device-driver binding is added.
+
+This RFC requests feedback on the companion architecture and exclusive
+feature-channel arbitration. Its mutex does not serialize vendor-feature
+requests from unrelated hidraw clients; concurrent use is unsupported.
+Physical unplug and system suspend stress testing remain outstanding.
+
+Assisted-by: LLM
